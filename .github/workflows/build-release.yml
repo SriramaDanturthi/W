@@ -1,0 +1,161 @@
+name: Build and release
+
+on:
+  workflow_dispatch:
+    inputs:
+      flavor:
+        description: 'App flavor to build'
+        type: choice
+        required: true
+        options:
+          - firebase
+          - offline
+          - d1
+      fast_build:
+        description: 'Firebase only: skip R8 and resource shrinking'
+        type: boolean
+        default: true
+
+permissions: {}
+
+concurrency:
+  group: build-release-${{ inputs.flavor }}
+  cancel-in-progress: false
+
+env:
+  APP_REPO: SriramaDanturthi/Every-Day-Finances
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+        working-directory: src
+    steps:
+      - name: Check out private app repo
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ env.APP_REPO }}
+          token: ${{ secrets.APP_REPO_TOKEN }}
+          path: src
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: jetbrains
+          java-version: 21
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@748248ddd2a24f49513d8f472f81c3a07d4d50e1 # v4.4.4
+        with:
+          cache-disabled: true
+          add-job-summary: never
+
+      - name: Tune Gradle for the CI runner
+        run: |
+          mkdir -p "$HOME/.gradle"
+          {
+            echo "org.gradle.jvmargs=-Xmx4608m -XX:+UseParallelGC -XX:MaxMetaspaceSize=768m -Dfile.encoding=UTF-8"
+            echo "kotlin.compiler.execution.strategy=in-process"
+            echo "org.gradle.vfs.watch=false"
+          } >> "$HOME/.gradle/gradle.properties"
+
+      - name: Write google-services.json
+        if: inputs.flavor == 'firebase'
+        env:
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+        run: |
+          mkdir -p app/src/firebase
+          printf '%s' "$GOOGLE_SERVICES_JSON" | tr -d '[:space:]' | base64 -d > app/src/firebase/google-services.json
+
+      - name: Prepare signing keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          mkdir -p app/keystore
+          if [ -n "$KEYSTORE_BASE64" ] && [ -n "$KEYSTORE_PASSWORD" ] && [ -n "$KEY_PASSWORD" ]; then
+            clean() { printf '%s' "$1" | LC_ALL=C tr -cd '\041-\176'; }
+            STORE_PASSWORD="$(clean "$KEYSTORE_PASSWORD")"
+            KEY_PASSWORD_CLEAN="$(clean "$KEY_PASSWORD")"
+            KEY_ALIAS_CLEAN="$(clean "$KEY_ALIAS")"
+            printf '%s' "$KEYSTORE_BASE64" | tr -d '[:space:]' | base64 -d > app/keystore/release-keystore.jks
+            if ! keytool -list -keystore app/keystore/release-keystore.jks -storepass "$STORE_PASSWORD" -alias "$KEY_ALIAS_CLEAN" > /dev/null 2>&1; then
+              echo "::error::Signing secrets are set but the keystore could not be opened."
+              exit 1
+            fi
+            {
+              echo "KEYSTORE_PASSWORD=$STORE_PASSWORD"
+              echo "KEY_PASSWORD=$KEY_PASSWORD_CLEAN"
+              echo "KEY_ALIAS=$KEY_ALIAS_CLEAN"
+              echo "SIGNED_WITH_RELEASE_KEY=true"
+            } >> "$GITHUB_ENV"
+          else
+            TEMP_PASSWORD="$(openssl rand -hex 16)"
+            keytool -genkeypair -keystore app/keystore/release-keystore.jks -alias everydayfinances \
+              -keyalg RSA -keysize 2048 -validity 365 -storepass "$TEMP_PASSWORD" -keypass "$TEMP_PASSWORD" \
+              -dname "CN=EverydayFinances CI Test" > /dev/null 2>&1
+            {
+              echo "KEYSTORE_PASSWORD=$TEMP_PASSWORD"
+              echo "KEY_PASSWORD=$TEMP_PASSWORD"
+              echo "KEY_ALIAS=everydayfinances"
+              echo "SIGNED_WITH_RELEASE_KEY=false"
+            } >> "$GITHUB_ENV"
+            echo "::warning::Signing secrets are not set; building with a temporary test key."
+          fi
+
+      - name: Build release APK
+        env:
+          FLAVOR: ${{ inputs.flavor }}
+          FAST_BUILD: ${{ inputs.fast_build }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          case "$FLAVOR" in
+            firebase) TASK=assembleFirebaseRelease; EXTRA="-PABI_FILTER=arm64-v8a,armeabi-v7a -PCI_FAST_BUILD=$FAST_BUILD" ;;
+            offline) TASK=assembleOfflineRelease; EXTRA="" ;;
+            d1) TASK=assembleD1Release; EXTRA="" ;;
+            *) echo "::error::Unknown flavor"; exit 1 ;;
+          esac
+          if ! ./gradlew ":app:$TASK" -PVERSION_CODE="$RUN_NUMBER" $EXTRA --quiet --console=plain > "$RUNNER_TEMP/build.log" 2>&1; then
+            echo "Build failed. First 60 matching lines:"
+            grep -E 'e: |error:|What went wrong|FAILURE|Execution failed' "$RUNNER_TEMP/build.log" | head -n 60 || true
+            exit 1
+          fi
+
+      - name: Publish draft release to the private repo
+        env:
+          GH_TOKEN: ${{ secrets.APP_REPO_TOKEN }}
+          FLAVOR: ${{ inputs.flavor }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          SHA="$(git rev-parse HEAD)"
+          SHORT_SHA="${SHA::7}"
+          DAY="$(date -u +%Y-%m-%d)"
+          TAG="${FLAVOR}-build-${DAY}-${SHORT_SHA}-${RUN_NUMBER}"
+          APK="app/build/outputs/apk/${FLAVOR}/release/app-${FLAVOR}-release.apk"
+          if [ ! -f "$APK" ]; then
+            echo "::error::APK not found at expected path"
+            exit 1
+          fi
+          if [ "$SIGNED_WITH_RELEASE_KEY" = "true" ]; then
+            NOTES="${FLAVOR} release build (${SHORT_SHA})."
+            PRE=""
+          else
+            NOTES="${FLAVOR} build (${SHORT_SHA}) signed with a temporary test key. For testing only; do not distribute."
+            PRE="--prerelease"
+          fi
+          gh release create "$TAG" "$APK" \
+            --repo "$APP_REPO" \
+            --draft $PRE \
+            --target "$SHA" \
+            --title "${FLAVOR} build ${DAY} (${SHORT_SHA})" \
+            --notes "$NOTES" > /dev/null
+          echo "Draft release $TAG created in $APP_REPO"
