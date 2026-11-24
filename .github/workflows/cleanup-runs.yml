@@ -1,0 +1,41 @@
+name: Cleanup runs
+
+on:
+  workflow_run:
+    workflows: ['Build and release']
+    types: [completed]
+  schedule:
+    - cron: '23 * * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+
+jobs:
+  delete-build-run:
+    if: github.event_name == 'workflow_run'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Delete the finished build run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" > /dev/null
+
+  sweep:
+    if: github.event_name != 'workflow_run'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Delete every completed run except this one
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CURRENT_RUN: ${{ github.run_id }}
+        run: |
+          ids=$(gh api --paginate -X GET "repos/$GITHUB_REPOSITORY/actions/runs" \
+            -f status=completed -f per_page=100 \
+            --jq ".workflow_runs[] | select(.id != $CURRENT_RUN) | .id")
+          for id in $ids; do
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/runs/$id" > /dev/null || true
+          done
