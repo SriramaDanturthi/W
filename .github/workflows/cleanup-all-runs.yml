@@ -1,0 +1,26 @@
+name: Cleanup all runs
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: write
+
+jobs:
+  delete-all:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Delete every completed run except this one, including failed and cancelled
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CURRENT_RUN: ${{ github.run_id }}
+        run: |
+          ids=$(gh api --paginate -X GET "repos/$GITHUB_REPOSITORY/actions/runs" \
+            -f status=completed -f per_page=100 \
+            --jq ".workflow_runs[] | select(.id != $CURRENT_RUN) | .id")
+          count=0
+          for id in $ids; do
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/runs/$id" > /dev/null && count=$((count + 1)) || true
+          done
+          echo "Deleted $count runs"
